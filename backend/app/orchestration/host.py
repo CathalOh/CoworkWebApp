@@ -32,7 +32,7 @@ from app.models.base import utcnow
 from app.observability import metrics
 from app.observability.logging import get_logger, run_id_var
 from app.orchestration.base import AgentEvent, ApprovalDecision, RunConfig
-from app.orchestration.events import get_event_bus
+from app.orchestration.events import TERMINAL_TYPES, get_event_bus
 from app.orchestration.registry import get_runtime
 from app.security.audit import record_audit
 
@@ -56,6 +56,7 @@ class RunHost:
         self.blocks: list[dict[str, Any]] = []  # ordered content blocks for the assistant message
         self._event_buffer: list[RunEvent] = []
         self._first_token_at: datetime | None = None
+        self._terminal: AgentEvent | None = None  # published only after finalize commits (clients refetch on it)
         self.started_at = utcnow()
 
     # ---- RuntimeHooks ------------------------------------------------------------------------
@@ -65,6 +66,18 @@ class RunHost:
     async def emit(self, type: str, data: dict[str, Any]) -> AgentEvent:
         self.seq += 1
         ev = AgentEvent(run_id=str(self.run_id), seq=self.seq, type=type, data=data)
+        if type == "mcp_status":  # merge connectors the host dropped before the runtime saw them (needs-auth/disabled)
+            seen = {srv.get("name") for srv in data.get("servers", [])}
+            extra = [st for st in self.cfg.context_manifest.get("connectors", []) if st.get("name") not in seen]
+            data = {**data, "servers": list(data.get("servers", [])) + extra}
+        if type in TERMINAL_TYPES:
+            if self._interrupted and type != "interrupted":
+                type, data = "interrupted", {"reason": "interrupted by user", **({"message": data.get("message")} if data.get("message") else {})}
+            if self._terminal is None:  # first terminal wins; it is published after the DB state is final
+                self._terminal = ev
+                self._event_buffer.append(RunEvent(run_id=self.run_id, seq=ev.seq, type=type, data=_jsonable(data), ts=ev.ts))
+            self._collect(type, data)
+            return ev
         await self._bus.publish(ev)
         self._event_buffer.append(RunEvent(run_id=self.run_id, seq=ev.seq, type=type, data=_jsonable(data), ts=ev.ts))
         if type == "assistant_text" and self._first_token_at is None:
@@ -235,7 +248,19 @@ class RunHost:
                     await get_sandbox_runner().stop(sandbox)
                 except Exception as exc:  # pragma: no cover
                     log.warning("sandbox_stop_failed", error=str(exc))
-            await self._finalize(status, error, result)
+            try:
+                if self._terminal is None:  # runtime returned without a terminal event
+                    await self.emit("error" if status == "failed" else "result",
+                                    {"message": error} if status == "failed" else {"text": result.get("result"), "usage": result.get("usage"),
+                                                                                    "total_cost_usd": result.get("total_cost_usd")})
+                await self._finalize(status, error, result)
+            except Exception as exc:  # pragma: no cover - never leave clients hanging without a terminal event
+                log.exception("finalize_failed", error=str(exc))
+                self._terminal = AgentEvent(run_id=str(self.run_id), seq=self._terminal.seq if self._terminal else self.seq + 1,
+                                            type="error", data={"message": f"finalize failed: {exc}"})
+            finally:
+                if self._terminal is not None:
+                    await self._bus.publish(self._terminal)
             metrics.inc("runs_finished_total", runtime=runtime.name, status=status)
         return result
 
