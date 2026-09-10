@@ -133,11 +133,11 @@ class RunHost:
                                                               "category": context.get("category"), "input": _preview(tool_input)})
             await db.commit()
             approval_id = ap.id
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[tool_use_id] = fut  # registered before the request is visible so a fast answer is never dropped
         await self.emit("approval_request", {"approval_id": str(approval_id), "tool_use_id": tool_use_id, "name": tool_name,
                                              "input": _jsonable(tool_input), "reason": context.get("reason"),
                                              "category": context.get("category"), "timeout_seconds": s.approval_timeout_seconds})
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
-        self._pending[tool_use_id] = fut
         t0 = utcnow()
         try:
             msg = await asyncio.wait_for(fut, timeout=s.approval_timeout_seconds)
@@ -172,9 +172,9 @@ class RunHost:
                                url=payload.get("url")))
             await db.execute(Run.__table__.update().where(Run.id == self.run_id).values(status="waiting_elicitation"))
             await db.commit()
-        await self.emit("elicitation", {"elicitation_id": elicitation_id, **_jsonable(payload)})
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending[f"elic:{elicitation_id}"] = fut
+        await self.emit("elicitation", {"elicitation_id": elicitation_id, **_jsonable(payload)})
         try:
             msg = await asyncio.wait_for(fut, timeout=s.approval_timeout_seconds)
             response = msg.get("response") or {"action": "decline"}

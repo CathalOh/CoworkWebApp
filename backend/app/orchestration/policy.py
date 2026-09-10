@@ -7,6 +7,7 @@ can_use_tool so they hold in every mode, including dontAsk/acceptEdits.
 from __future__ import annotations
 
 import fnmatch
+import posixpath
 import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -40,22 +41,41 @@ def _paths_from_input(tool_input: dict[str, Any]) -> list[str]:
         v = tool_input.get(k)
         if isinstance(v, list):
             out.extend(str(x) for x in v)
+    for e in tool_input.get("edits", []) if isinstance(tool_input.get("edits"), list) else []:  # MultiEdit
+        if isinstance(e, dict) and isinstance(e.get("file_path"), str):
+            out.append(e["file_path"])
     return out
 
 
 def is_secret_path(path: str) -> bool:
     p = PurePosixPath(path).as_posix()
+    if p.startswith("~"):
+        p = "/home/x" + p[1:]  # expand so patterns like */.ssh/* match ~/.ssh/id_rsa
     return any(fnmatch.fnmatch(p, pat) for pat in SECRET_PATH_PATTERNS)
 
 
+def normalize_path(path: str, workspace: str) -> str:
+    """Resolve `path` the way the tool would (relative => under the workspace cwd), collapsing `..` segments."""
+    p = path if path.startswith("/") else posixpath.join(workspace, path)
+    return posixpath.normpath(p)
+
+
 def is_inside_workspace(path: str, workspace: str) -> bool:
-    if not path.startswith("/"):
-        return True  # relative => resolved under cwd (the workspace)
-    try:
-        PurePosixPath(path).relative_to(PurePosixPath(workspace))
-        return True
-    except ValueError:
-        return False
+    p = normalize_path(path, workspace)
+    ws = posixpath.normpath(workspace)
+    return p == ws or p.startswith(ws.rstrip("/") + "/")
+
+
+_BASH_PATH_RE = re.compile(r"(?:~|\$HOME|/)[A-Za-z0-9_./~$-]*|(?:\.\./)+[A-Za-z0-9_./-]*|(?<!\S)[\w.-]*\.env\b")
+
+
+def bash_paths(command: str) -> list[str]:
+    """Best-effort extraction of path-like tokens from a shell command (for secret-path screening)."""
+    out = []
+    for m in _BASH_PATH_RE.findall(command):
+        m = m.replace("$HOME", "~")
+        out.append(m)
+    return out
 
 
 def is_delete(tool_name: str, tool_input: dict[str, Any]) -> bool:
@@ -93,7 +113,13 @@ def evaluate(
     sandbox_execution_enabled: bool = True,
 ) -> PolicyDecision:
     # 1. hard denies that hold in every mode
+    if tool_name == "Bash":
+        for p in bash_paths(str(tool_input.get("command", ""))):
+            if is_secret_path(p) or is_secret_path(normalize_path(p, workspace_path)):
+                return PolicyDecision("deny", f"command references a secret path: {p}", "secret")
     for p in _paths_from_input(tool_input):
+        if is_secret_path(normalize_path(p, workspace_path)):
+            return PolicyDecision("deny", f"access to secret path blocked: {p}", "secret")
         if is_secret_path(p):
             return PolicyDecision("deny", f"access to secret path blocked: {p}", "secret")
         if tool_name in WRITE_TOOLS | {"Read", "Bash"} and not is_inside_workspace(p, workspace_path):

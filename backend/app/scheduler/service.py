@@ -29,7 +29,10 @@ def validate_cron(cron: str) -> bool:
 
 async def due_schedules(db: AsyncSession) -> list[Schedule]:
     now = utcnow()
-    rows = (await db.execute(select(Schedule).where(Schedule.enabled.is_(True), Schedule.next_run <= now))).scalars().all()
+    q = select(Schedule).where(Schedule.enabled.is_(True), Schedule.next_run <= now)
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        q = q.with_for_update(skip_locked=True)  # two tickers may run concurrently; each fires a disjoint set
+    rows = (await db.execute(q)).scalars().all()
     for s in rows:  # advance immediately so a slow worker does not double-fire
         s.last_fired_at = now
         s.next_run = compute_next(s.cron, s.timezone, now)
