@@ -1,0 +1,60 @@
+name: ci
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env: {POSTGRES_USER: app, POSTGRES_PASSWORD: app, POSTGRES_DB: app}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U app -d app" --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - uses: actions/setup-node@v4
+        with: {node-version: "22"}
+      - run: pip install uv && cd backend && uv venv .venv && . .venv/bin/activate && uv pip install -e ".[dev]"
+      - run: cd backend && . .venv/bin/activate && ruff check app tests
+      - name: unit + integration (sqlite, in-memory bus, mock runtime)
+        run: cd backend && . .venv/bin/activate && pytest -q
+      - name: integration on Postgres (Alembic, partitions, append-only trigger, pgvector)
+        run: cd backend && . .venv/bin/activate && TEST_DATABASE_URL=postgresql+asyncpg://app:app@localhost:5432/app pytest -q
+      - name: mock ILIAD / MCP / OAuth / OIDC server tests
+        run: cd backend && . .venv/bin/activate && pip install -r ../tests/mock_iliad/requirements.txt && pytest -q ../tests/mock_iliad
+      - name: Agent SDK adapter against mock ILIAD (real bundled claude CLI)
+        run: |
+          cd backend && . .venv/bin/activate
+          (cd ../tests/mock_iliad && nohup uvicorn server:app --port 9100 > /tmp/mock.log 2>&1 &)
+          sleep 3
+          MOCK_ILIAD_URL=http://localhost:9100 pytest -q tests/test_agent_sdk_live.py
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: "22", cache: npm, cache-dependency-path: frontend/package-lock.json}
+      - run: cd frontend && npm ci && npm run typecheck && npm run build
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - uses: actions/setup-node@v4
+        with: {node-version: "22"}
+      - run: pip install uv && cd backend && uv venv .venv && . .venv/bin/activate && uv pip install -e ".[dev]"
+      - run: cd frontend && npm ci
+      - run: cd tests/e2e && npm ci && npx playwright install --with-deps chromium && npx playwright test
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: {name: playwright-report, path: tests/e2e/report}

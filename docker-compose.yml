@@ -1,0 +1,109 @@
+# Local runtime for the Cowork backbone. `docker compose up --build` then open http://localhost:5173
+# Profiles: default = mock ILIAD (Agent SDK pointed at the mock Anthropic API); `--profile litellm` adds the
+# OpenAI-compat fallback gateway; `--profile sandbox` builds the hardened sandbox image + egress proxy.
+name: cowork-backbone
+
+x-backend-env: &backend-env
+  env_file: [config/.env]
+  environment:
+    DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/app
+    REDIS_URL: redis://redis:6379/0
+    OBJECT_STORE_PATH: /data/objects
+    WORKSPACES_ROOT: /data/workspaces
+    PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+    FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:5173}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment: {POSTGRES_USER: app, POSTGRES_PASSWORD: app, POSTGRES_DB: app}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    ports: ["5432:5432"]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U app -d app"], interval: 5s, timeout: 3s, retries: 20}
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "yes"]
+    volumes: [redisdata:/data]
+    ports: ["6379:6379"]
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s, retries: 20}
+
+  mock-iliad:
+    build: tests/mock_iliad
+    ports: ["9100:9100"]
+    healthcheck: {test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:9100/v1/models')\" || curl -f http://localhost:9100/v1/models"], interval: 5s, timeout: 3s, retries: 20}
+
+  backend:
+    build: backend
+    <<: *backend-env
+    command: ["./entrypoint.sh", "api"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    volumes:
+      - appdata:/data
+      - ./config:/srv/config:ro
+      - /var/run/docker.sock:/var/run/docker.sock   # only used when SANDBOX_BACKEND=docker
+    ports: ["8000:8000"]
+    healthcheck: {test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"], interval: 10s, timeout: 3s, retries: 10}
+
+  worker:
+    build: backend
+    <<: *backend-env
+    command: ["./entrypoint.sh", "worker"]
+    depends_on:
+      backend: {condition: service_healthy}
+    volumes:
+      - appdata:/data
+      - ./config:/srv/config:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    deploy:
+      resources:
+        limits: {cpus: "4", memory: 6g}   # SDK subprocess-per-session: ~1 CPU / 1 GiB each (PRD §7.4)
+
+  scheduler:
+    build: backend
+    <<: *backend-env
+    command: ["./entrypoint.sh", "scheduler"]
+    depends_on:
+      backend: {condition: service_healthy}
+    volumes: [appdata:/data]
+
+  frontend:
+    build: frontend
+    depends_on: [backend]
+    ports: ["5173:80"]
+
+  # ---- optional: per-run hardened sandboxes + egress allowlist proxy ----------------------
+  sandbox-image:
+    profiles: [sandbox]
+    build: sandbox-runner
+    image: cowork-sandbox:latest
+    command: ["true"]
+
+  egress-proxy:
+    profiles: [sandbox]
+    image: vimagick/tinyproxy
+    volumes:
+      - ./config/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro
+      - ./config/egress-allowlist.txt:/etc/tinyproxy/egress-allowlist.txt:ro
+    networks: [default, sandbox-egress]
+
+  # ---- optional: OpenAI-compatible fallback gateway (Decision Gate A = FAIL path) ------------
+  litellm:
+    profiles: [litellm]
+    image: ghcr.io/berriai/litellm:main-latest
+    command: ["--config", "/config/litellm.yaml", "--port", "4000"]
+    volumes: ["./config/litellm.yaml:/config/litellm.yaml:ro"]
+    env_file: [config/.env]
+    ports: ["4000:4000"]
+
+networks:
+  sandbox-egress:
+    name: sandbox-egress
+    internal: true
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  appdata: {}
